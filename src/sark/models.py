@@ -70,3 +70,14 @@ class Event(BaseModel):
         if self.verdict in (Verdict.CONFIRMED, Verdict.INCONCLUSIVE) and self.confidence is None:
             raise ValueError(f"{self.verdict.value} events require confidence")
         return self
+
+
+class Record(BaseModel):
+    backend: str = "redis"
+    db: str = "db0"
+    namespace: str
+    key: str
+    type: str
+    ttl_ms: int | None = None
+    value: object = None
+    source_vector: str = "RED-VALUE-READ"

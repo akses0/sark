@@ -15,11 +15,20 @@ from sark.backends.redis_vectors import (
     resolve_auth,
     try_credentials,
 )
+from sark.data_layer import DUMP_BUDGET, build_record, collect_keys
 from sark.engine.plugins import load_plugins
-from sark.engine.scheduler import ScanContext
-from sark.models import Channel, Event, Verdict
+from sark.engine.scheduler import RateLimitedResp, ScanContext
+from sark.models import (
+    Channel,
+    CommandEvidence,
+    Event,
+    Evidence,
+    Record,
+    ResponseEvidence,
+    Verdict,
+)
 from sark.report.md import summarize
-from sark.resp import RespConnection, Unreachable
+from sark.resp import RespConnection, RespError, Unreachable, wire_preview
 from sark.targets import Target
 
 MAX_WORDLIST_ENTRIES = 10_000
@@ -187,18 +196,22 @@ async def _credential_phase(
     return event, ctx
 
 
-async def _scan_target(
+async def _scan_target_removed() -> None:
+    return None
+
+
+async def _open_session(
     run_id: str,
     target: Target,
     risk: int,
     timeout: float,
     insecure: bool,
     ca_file: str | None,
-    rps: float,
     user: str | None,
     password: str | None,
     wordlist_entries: list[str],
-) -> list[Event]:
+    emit_auth_event: bool,
+) -> tuple[RespConnection | None, ScanContext | None, list[Event]]:
     events: list[Event] = []
     try:
         conn, fallback = await _connect_probing_tls(
@@ -211,7 +224,7 @@ async def _scan_target(
         events.append(
             _advisory(run_id, target.uri(), "RUN-UNREACHABLE", f"connection failed: {exc}")
         )
-        return events
+        return None, None, events
     auth_ok, auth_detail = await resolve_auth(conn)
     ctx = ScanContext(
         run_id=run_id,
@@ -227,17 +240,18 @@ async def _scan_target(
     )
     if risk >= 2:
         if auth_ok:
-            events.append(
-                Event(
-                    run_id=run_id,
-                    target=target.uri(),
-                    vector="RED-AUTH-CREDS",
-                    channel=Channel.DIRECT,
-                    verdict=Verdict.REFUTED,
-                    confidence=1.0,
-                    detail="authentication not required; anonymous principal active",
+            if emit_auth_event:
+                events.append(
+                    Event(
+                        run_id=run_id,
+                        target=target.uri(),
+                        vector="RED-AUTH-CREDS",
+                        channel=Channel.DIRECT,
+                        verdict=Verdict.REFUTED,
+                        confidence=1.0,
+                        detail="authentication not required; anonymous principal active",
+                    )
                 )
-            )
         else:
             candidates: list[tuple[str | None, str]] = []
             if password and user:
@@ -247,7 +261,8 @@ async def _scan_target(
             candidates.extend((None, entry) for entry in CURATED_MATRIX)
             candidates.extend((user, entry) for entry in wordlist_entries)
             cred_event, ctx = await _credential_phase(conn, ctx, candidates)
-            events.append(cred_event)
+            if emit_auth_event:
+                events.append(cred_event)
             if cred_event.verdict is Verdict.REFUTED and ctx.auth_ping_ok is False:
                 handoff = (
                     "curated matrix exhausted; sark detects misconfigurations, it does not "
@@ -256,12 +271,7 @@ async def _scan_target(
                     "then rerun with --user/--pass."
                 )
                 events.append(_advisory(run_id, target.uri(), "RUN-HANDOFF", handoff))
-    backend = RedisBackend()
-    jobs = backend.build_jobs(ctx, conn)
-    for _, executor in jobs:
-        events.append(await executor())
-    await conn.close()
-    return events
+    return conn, ctx, events
 
 
 @app.command()
@@ -301,20 +311,26 @@ def scan(
 
     async def drive() -> None:
         for target in resolved:
-            all_events.extend(
-                await _scan_target(
-                    run_id,
-                    target,
-                    risk=risk,
-                    timeout=timeout,
-                    insecure=insecure,
-                    ca_file=ca_file,
-                    rps=rps,
-                    user=user,
-                    password=password,
-                    wordlist_entries=wordlist_entries,
-                )
+            conn, ctx, session_events = await _open_session(
+                run_id,
+                target,
+                risk=risk,
+                timeout=timeout,
+                insecure=insecure,
+                ca_file=ca_file,
+                user=user,
+                password=password,
+                wordlist_entries=wordlist_entries,
+                emit_auth_event=True,
             )
+            all_events.extend(session_events)
+            if conn is None or ctx is None:
+                return
+            backend = RedisBackend()
+            jobs = backend.build_jobs(ctx, conn)
+            for _, executor in jobs:
+                all_events.append(await executor())
+            await conn.close()
 
     asyncio.run(drive())
     for event in all_events:
@@ -322,6 +338,221 @@ def scan(
     verdicts = {event.verdict for event in all_events}
     if Verdict.CONFIRMED in verdicts:
         raise typer.Exit(code=2)
+
+
+def _emit_err(event: Event) -> None:
+    print(event.model_dump_json(), file=sys.stderr)
+
+
+async def _data_session(
+    run_id: str,
+    target: Target,
+    timeout: float,
+    insecure: bool,
+    ca_file: str | None,
+    user: str | None,
+    password: str | None,
+    wordlist_entries: list[str],
+) -> tuple[RespConnection | None, ScanContext | None, list[Event], bool]:
+    conn, ctx, events = await _open_session(
+        run_id,
+        target,
+        risk=2,
+        timeout=timeout,
+        insecure=insecure,
+        ca_file=ca_file,
+        user=user,
+        password=password,
+        wordlist_entries=wordlist_entries,
+        emit_auth_event=True,
+    )
+    authenticated_or_anonymous = ctx is not None and (
+        ctx.auth_ping_ok is not False or ctx.auth_restricted
+    )
+    return conn, ctx, events, authenticated_or_anonymous
+
+
+async def _run_enum(
+    run_id: str,
+    target: Target,
+    sample: int,
+    pattern: str | None,
+    timeout: float,
+    insecure: bool,
+    ca_file: str | None,
+    user: str | None,
+    password: str | None,
+    wordlist_entries: list[str],
+    rps: float,
+) -> tuple[list[Event], list[Record], bool]:
+    from sark.data_layer import PREVIEW_BUDGET, collect_keys, namespace_of, parse_databases
+
+    conn, ctx, events, usable = await _data_session(
+        run_id, target, timeout, insecure, ca_file, user, password, wordlist_entries
+    )
+    if conn is None or ctx is None:
+        return events, [], False
+    if not usable:
+        events.append(
+            Event(
+                run_id=run_id,
+                target=target.uri(),
+                vector="ENUM-SUMMARY",
+                channel=Channel.DIRECT,
+                verdict=Verdict.INCONCLUSIVE,
+                confidence=0.3,
+                detail="authentication required; keyspace mapping unavailable",
+            )
+        )
+        await conn.close()
+        return events, [], False
+    glob = pattern or "*"
+    try:
+        info = await conn.execute("INFO", "keyspace")
+    except RespError as exc:
+        events.append(
+            Event(
+                run_id=run_id,
+                target=target.uri(),
+                vector="ENUM-SUMMARY",
+                channel=Channel.DIRECT,
+                verdict=Verdict.INCONCLUSIVE,
+                confidence=0.3,
+                detail=f"keyspace inventory unavailable: -{exc.message}",
+            )
+        )
+        await conn.close()
+        return events, [], False
+    records: list[Record] = []
+    namespace_counts: dict[str, int] = {}
+    truncated_any = False
+    databases = parse_databases(info.text()) or {"db0": 0}
+    for db in databases:
+        if db != "db0":
+            try:
+                await conn.execute("SELECT", db.removeprefix("db"))
+            except RespError:
+                continue
+        keys, truncated = await collect_keys(conn, glob, max_keys=5000)
+        truncated_any = truncated_any or truncated
+        for key in keys:
+            ns = namespace_of(key)
+            namespace_counts[ns] = namespace_counts.get(ns, 0) + 1
+        if sample > 0:
+            for key in keys[:sample]:
+                record = await build_record(conn, key, PREVIEW_BUDGET, db=db)
+                if record is not None:
+                    records.append(record)
+    if namespace_counts:
+        summary = ", ".join(f"{ns}={count}" for ns, count in sorted(namespace_counts.items()))
+        detail = f"namespaces: {summary}"
+        if truncated_any:
+            detail += "; scan budget hit (truncated)"
+        events.append(
+            Event(
+                run_id=run_id,
+                target=target.uri(),
+                vector="ENUM-SUMMARY",
+                channel=Channel.DIRECT,
+                verdict=Verdict.CONFIRMED,
+                confidence=0.8,
+                detail=detail,
+                evidence=mk_summary_evidence([info]),
+            )
+        )
+    else:
+        events.append(
+            Event(
+                run_id=run_id,
+                target=target.uri(),
+                vector="ENUM-SUMMARY",
+                channel=Channel.DIRECT,
+                verdict=Verdict.REFUTED,
+                confidence=0.8,
+                detail="no keys visible to principal under the given pattern",
+                evidence=mk_summary_evidence([info]),
+            )
+        )
+    await conn.close()
+    return events, records, bool(namespace_counts)
+
+
+def mk_summary_evidence(replies: list[object]) -> Evidence:
+    from sark.resp import Reply
+
+    commands = []
+    responses = []
+    for reply in replies:
+        assert isinstance(reply, Reply)
+        commands.append(CommandEvidence(wire=wire_preview(reply.raw_request)))
+        responses.append(
+            ResponseEvidence(prefix=reply.prefix, size=reply.size, sha256=reply.sha256)
+        )
+    return Evidence(commands=commands, responses=responses)
+
+
+async def _run_dump(
+    run_id: str,
+    target: Target,
+    pattern: str | None,
+    start: int,
+    stop: int,
+    timeout: float,
+    insecure: bool,
+    ca_file: str | None,
+    user: str | None,
+    password: str | None,
+    wordlist_entries: list[str],
+    rps: float,
+) -> tuple[list[Event], list[Record], bool]:
+    conn, ctx, events, usable = await _data_session(
+        run_id, target, timeout, insecure, ca_file, user, password, wordlist_entries
+    )
+    if conn is None or ctx is None:
+        return events, [], False
+    if not usable:
+        events.append(
+            Event(
+                run_id=run_id,
+                target=target.uri(),
+                vector="DUMP-SUMMARY",
+                channel=Channel.DIRECT,
+                verdict=Verdict.INCONCLUSIVE,
+                confidence=0.3,
+                detail="authentication required; extraction unavailable",
+            )
+        )
+        await conn.close()
+        return events, [], False
+    limited = RateLimitedResp(conn, rps)
+    glob = pattern or "*"
+    keys, _truncated = await collect_keys(limited, glob, max_keys=stop + start + 1)
+    window = keys[start : start + stop]
+    records: list[Record] = []
+    for key in window:
+        try:
+            record = await build_record(limited, key, DUMP_BUDGET)
+        except RespError:
+            continue
+        if record is not None:
+            records.append(record)
+    cap_hit = len(keys) >= start + stop + 1
+    detail = f"extracted {len(records)} records (window [{start}, {start + stop}])"
+    if cap_hit:
+        detail += "; scan budget reached — narrow --pattern or raise --stop for full coverage"
+    events.append(
+        Event(
+            run_id=run_id,
+            target=target.uri(),
+            vector="DUMP-SUMMARY",
+            channel=Channel.DIRECT,
+            verdict=(Verdict.CONFIRMED if records else Verdict.REFUTED),
+            confidence=0.85 if records else 0.8,
+            detail=detail,
+        )
+    )
+    await conn.close()
+    return events, records, bool(records)
 
 
 @app.command(name="enum")
@@ -334,20 +565,80 @@ def enum_(
     pattern: Annotated[
         str | None, typer.Option("--pattern", help="Key glob, e.g. 'session:*'.")
     ] = None,
+    user: Annotated[
+        str | None, typer.Option("--user", help="ACL username for authentication attempts.")
+    ] = None,
+    password: Annotated[
+        str | None, typer.Option("--pass", help="Password for resumed runs with known creds.")
+    ] = None,
+    wordlist: Annotated[
+        Path | None,
+        typer.Option("--wordlist", help="Opt-in credential spray; stops on first hit."),
+    ] = None,
+    timeout: Annotated[float, typer.Option("--timeout", min=0.5)] = 5.0,
+    insecure: Annotated[
+        bool, typer.Option("--insecure", help="Skip TLS certificate verification.")
+    ] = False,
+    ca_file: Annotated[
+        str | None, typer.Option("--tls-ca", help="CA bundle for TLS verification.")
+    ] = None,
+    rps: Annotated[float, typer.Option("--rps", min=0.1)] = 100.0,
+    out: Annotated[Path | None, typer.Option("--out", help="Write NDJSON records here.")] = None,
 ) -> None:
-    """Map the keyspace: logical DBs, namespaces, types and counts."""
-    run_id = _run_id()
+    """Map the keyspace: logical DBs, namespaces, types and counts.
+
+    Records stream to stdout (or --out); events stream to stderr.
+    """
     resolved = _resolve_targets(list(targets or []), targets_file)
-    for target in resolved:
-        scope = f" pattern={pattern}" if pattern else ""
-        _emit(
-            _advisory(
+    wordlist_entries = _load_wordlist(wordlist)
+    run_id = _run_id()
+    all_events: list[Event] = []
+    all_records: list[Record] = []
+    found = False
+
+    async def drive() -> None:
+        nonlocal found
+        for target in resolved:
+            events, records, hit = await _run_enum(
                 run_id,
-                target.uri(),
-                "ENUM-STUB",
-                f"skeleton build: census with sample={sample}{scope} lands in M3",
+                target,
+                sample=sample,
+                pattern=pattern,
+                timeout=timeout,
+                insecure=insecure,
+                ca_file=ca_file,
+                user=user,
+                password=password,
+                wordlist_entries=wordlist_entries,
+                rps=rps,
             )
-        )
+            all_events.extend(events)
+            all_records.extend(records)
+            found = found or hit
+
+    asyncio.run(drive())
+    out_handle = out.open("w", encoding="utf-8") if out else sys.stdout
+    try:
+        for record in all_records:
+            out_handle.write(record.model_dump_json() + "\n")
+    finally:
+        if out is not None:
+            out_handle.close()
+    for event in all_events:
+        _emit_err(event)
+    verdicts = {event.verdict for event in all_events if event.vector != "RUN-UNREACHABLE"}
+    if found or Verdict.CONFIRMED in verdicts:
+        raise typer.Exit(code=2)
+    if not usable_session(all_events):
+        raise typer.Exit(code=3)
+
+
+def usable_session(events: list[Event]) -> bool:
+    return not any(event.vector == "RUN-UNREACHABLE" for event in events) and not any(
+        event.detail is not None and "authentication required" in event.detail
+        for event in events
+        if event.vector in ("ENUM-SUMMARY", "DUMP-SUMMARY")
+    )
 
 
 @app.command()
@@ -359,21 +650,77 @@ def dump(
     ] = None,
     start: Annotated[int, typer.Option("--start", min=0)] = 0,
     stop: Annotated[int, typer.Option("--stop", min=0)] = 1000,
+    dump_format: Annotated[
+        str, typer.Option("--dump-format", help="Record format; ndjson only pre-M4.")
+    ] = "ndjson",
+    user: Annotated[
+        str | None, typer.Option("--user", help="ACL username for authentication attempts.")
+    ] = None,
+    password: Annotated[
+        str | None, typer.Option("--pass", help="Password for resumed runs with known creds.")
+    ] = None,
+    wordlist: Annotated[
+        Path | None,
+        typer.Option("--wordlist", help="Opt-in credential spray; stops on first hit."),
+    ] = None,
+    timeout: Annotated[float, typer.Option("--timeout", min=0.5)] = 5.0,
+    insecure: Annotated[
+        bool, typer.Option("--insecure", help="Skip TLS certificate verification.")
+    ] = False,
+    ca_file: Annotated[
+        str | None, typer.Option("--tls-ca", help="CA bundle for TLS verification.")
+    ] = None,
+    rps: Annotated[float, typer.Option("--rps", min=0.1)] = 100.0,
     out: Annotated[Path | None, typer.Option("--out", help="Write NDJSON records here.")] = None,
 ) -> None:
-    """Extract records matching a key pattern, capped and evidence-referenced."""
-    run_id = _run_id()
+    """Extract records matching a key pattern, capped and evidence-referenced.
+
+    Records stream to stdout (or --out); events stream to stderr.
+    """
+    if dump_format != "ndjson":
+        raise typer.BadParameter(f"unsupported format {dump_format!r}: only 'ndjson' ships pre-M4")
     resolved = _resolve_targets(list(targets or []), targets_file)
-    for target in resolved:
-        scope = f" pattern={pattern}" if pattern else ""
-        _emit(
-            _advisory(
+    wordlist_entries = _load_wordlist(wordlist)
+    run_id = _run_id()
+    all_events: list[Event] = []
+    all_records: list[Record] = []
+    found = False
+
+    async def drive() -> None:
+        nonlocal found
+        for target in resolved:
+            events, records, hit = await _run_dump(
                 run_id,
-                target.uri(),
-                "DUMP-STUB",
-                f"skeleton build: window [{start}, {stop}]{scope} lands in M3",
+                target,
+                pattern=pattern,
+                start=start,
+                stop=stop,
+                timeout=timeout,
+                insecure=insecure,
+                ca_file=ca_file,
+                user=user,
+                password=password,
+                wordlist_entries=wordlist_entries,
+                rps=rps,
             )
-        )
+            all_events.extend(events)
+            all_records.extend(records)
+            found = found or hit
+
+    asyncio.run(drive())
+    out_handle = out.open("w", encoding="utf-8") if out else sys.stdout
+    try:
+        for record in all_records:
+            out_handle.write(record.model_dump_json() + "\n")
+    finally:
+        if out is not None:
+            out_handle.close()
+    for event in all_events:
+        _emit_err(event)
+    if found:
+        raise typer.Exit(code=2)
+    if not usable_session(all_events):
+        raise typer.Exit(code=3)
 
 
 @app.command()

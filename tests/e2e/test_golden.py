@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import socket
 from collections.abc import Iterator
@@ -56,10 +57,30 @@ def seed_exposed(uri: str) -> None:
             sock.recv(64)
 
 
+def seed_hardened(uri: str, admin_password: str) -> None:
+    from sark.targets import Target
+
+    target = Target.from_uri(uri)
+    commands = [
+        encode_command("AUTH", admin_password),
+        encode_command("SET", "app:feature:flag", "on"),
+        encode_command("HSET", "app:config", "mode", "debug"),
+        encode_command("SET", "session:admin", "leakme"),
+    ]
+    with socket.create_connection((target.host, target.port), timeout=2) as sock:
+        for command in commands:
+            sock.sendall(command)
+            sock.recv(64)
+
+
+HARDENED_ADMIN_PASSWORD = "sark-hardened-passphrase-9f3a"
+
+
 @pytest.fixture(scope="session", autouse=True)
 def seed_data() -> Iterator[None]:
     if os.environ.get("SARK_E2E") == "1":
         seed_exposed(EXPOSED_URI)
+        seed_hardened(HARDENED_URI, HARDENED_ADMIN_PASSWORD)
     yield
 
 
@@ -175,3 +196,128 @@ def test_risk1_still_safe_tier_only_on_exposed() -> None:
     assert exit_code == 2
     mapped = by_vector(events)
     assert set(mapped) == SAFE_VECTOR_IDS
+
+
+def run_verb(verb: str, *args: str) -> tuple[list[dict[str, object]], list[Event], int, str]:
+    result = runner.invoke(app, [verb, *args])
+    records = [
+        json.loads(line)
+        for line in result.stdout.splitlines()
+        if line.strip().startswith("{") and '"vector"' not in line
+    ]
+    events = [
+        Event.model_validate_json(line)
+        for line in result.stderr.splitlines()
+        if line.strip().startswith("{")
+    ]
+    return records, events, result.exit_code, result.stdout
+
+
+def test_enum_maps_seeded_namespaces() -> None:
+    records, events, exit_code, _ = run_verb(
+        "enum", "-t", EXPOSED_URI, "--sample", "5", "--rps", "500"
+    )
+    assert exit_code == 2, events
+    summaries = [event for event in events if event.vector == "ENUM-SUMMARY"]
+    assert summaries and summaries[0].verdict is Verdict.CONFIRMED
+    assert "sark" in (summaries[0].detail or "")
+    types = {record["type"] for record in records}
+    assert {"string", "hash", "list"} <= types
+    assert all(record["source_vector"] == "RED-VALUE-READ" for record in records)
+
+
+def test_dump_extracts_seeded_records(tmp_path: object) -> None:
+    out = tmp_path / "loot.ndjson"
+    result = runner.invoke(
+        app,
+        [
+            "dump",
+            "-t",
+            EXPOSED_URI,
+            "--pattern",
+            "sark:e2e:*",
+            "--rps",
+            "500",
+            "--out",
+            str(out),
+        ],
+    )
+    assert result.exit_code == 2, result.stderr
+    lines = out.read_text(encoding="utf-8").strip().splitlines()
+    records = [json.loads(line) for line in lines]
+    assert len(records) == 3
+    by_key = {record["key"]: record for record in records}
+    assert by_key["sark:e2e:string"]["value"] == "v"
+    assert by_key["sark:e2e:hash"]["value"] == {"field": "value"}
+    assert by_key["sark:e2e:list"]["value"] == ["a", "b"]
+    for record in records:
+        assert record["backend"] == "redis"
+        assert record["db"] == "db0"
+        assert record["namespace"] == "sark"
+        assert record["ttl_ms"] == -1
+
+
+def test_dump_window_start_stop(tmp_path: object) -> None:
+    out = tmp_path / "window.ndjson"
+    result = runner.invoke(
+        app,
+        [
+            "dump",
+            "-t",
+            EXPOSED_URI,
+            "--pattern",
+            "sark:e2e:*",
+            "--start",
+            "1",
+            "--stop",
+            "1",
+            "--rps",
+            "500",
+            "--out",
+            str(out),
+        ],
+    )
+    assert result.exit_code == 2
+    lines = out.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 1
+
+
+def test_dump_requires_auth_exits_three() -> None:
+    _records, _events, exit_code, stdout = run_verb("dump", "-t", HARDENED_URI)
+    assert exit_code == 3
+    assert stdout.strip() == ""
+
+
+def test_dump_restricted_principal_scoped_extraction(tmp_path: object) -> None:
+    out = tmp_path / "scoped.ndjson"
+    result = runner.invoke(
+        app,
+        [
+            "dump",
+            "-t",
+            HARDENED_URI,
+            "--user",
+            "sarklow",
+            "--pass",
+            "sarklow-pass",
+            "--pattern",
+            "app:*",
+            "--rps",
+            "500",
+            "--out",
+            str(out),
+        ],
+    )
+    assert result.exit_code == 2, result.stderr
+    records = [json.loads(line) for line in out.read_text(encoding="utf-8").strip().splitlines()]
+    keys = {record["key"] for record in records}
+    assert keys == {"app:feature:flag", "app:config"}
+
+
+def test_dump_rejects_unknown_format() -> None:
+    result = runner.invoke(
+        app,
+        ["dump", "-t", EXPOSED_URI, "--dump-format", "csv"],
+    )
+    assert result.exit_code != 0
+    assert "pre-M4" in result.output or "unsupported" in result.output

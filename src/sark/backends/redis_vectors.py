@@ -4,6 +4,7 @@ import re
 from collections.abc import Awaitable, Callable
 
 from sark.backends.redis_cves import evaluate
+from sark.data_layer import collect_keys, key_type
 from sark.engine.scheduler import ScanContext
 from sark.models import (
     Channel,
@@ -552,6 +553,56 @@ async def red_census(ctx: ScanContext, conn: SupportsResp) -> Event:
     )
 
 
+async def red_value_read(ctx: ScanContext, conn: SupportsResp) -> Event:
+    if ctx.auth_ping_ok is False and not ctx.auth_restricted:
+        return mk_event(
+            ctx,
+            "RED-VALUE-READ",
+            Verdict.INCONCLUSIVE,
+            0.3,
+            "keyspace requires credentials; value sampling deferred until authenticated",
+        )
+    keys, truncated = await collect_keys(conn, "*", max_keys=20)
+    if not keys:
+        return mk_event(
+            ctx,
+            "RED-VALUE-READ",
+            Verdict.REFUTED,
+            0.8,
+            "keyspace empty; no values readable to principal",
+        )
+    types_seen: dict[str, str] = {}
+    for key in keys[:10]:
+        type_name = await key_type(conn, key)
+        if type_name != "none" and type_name not in types_seen:
+            types_seen[type_name] = key
+    sampled: list[Reply] = []
+    first = sorted(types_seen.items())[0] if types_seen else None
+    if first is not None:
+        type_name, key = first
+        probe = {
+            "string": ("GET", key),
+            "hash": ("HSCAN", key, "0", "COUNT", "3"),
+            "list": ("LRANGE", key, "0", "2"),
+            "set": ("SSCAN", key, "0", "COUNT", "3"),
+            "zset": ("ZRANGE", key, "0", "2", "WITHSCORES"),
+            "stream": ("XLEN", key),
+        }.get(type_name)
+        if probe is not None:
+            sampled.append(await conn.execute(*probe))
+    detail_types = ",".join(sorted(types_seen)) or "none"
+    cap_note = "; scan budget hit (truncated sample)" if truncated else ""
+    return mk_event(
+        ctx,
+        "RED-VALUE-READ",
+        Verdict.CONFIRMED,
+        0.85,
+        f"values readable to principal; types observed: {detail_types} "
+        f"(sampled {min(len(keys), 10)} keys{cap_note})",
+        replies=sampled,
+    )
+
+
 EXECUTORS: dict[str, ScanFn] = {
     "RED-UNAUTH": red_unauth,
     "RED-TLS-RESP3": red_tls_resp3,
@@ -560,4 +611,5 @@ EXECUTORS: dict[str, ScanFn] = {
     "RED-CONFIG-AUDIT": red_config_audit,
     "RED-LUA-PROBE": red_lua_probe,
     "RED-CENSUS": red_census,
+    "RED-VALUE-READ": red_value_read,
 }

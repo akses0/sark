@@ -7,6 +7,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from pydantic import BaseModel, Field
 
 from sark.models import Event
+from sark.resp import Reply, RespConnection
 
 
 class TokenBucket:
@@ -45,6 +46,19 @@ class ScanContext(BaseModel):
 
 
 Executor = Callable[[], Awaitable[Event]]
+
+
+class RateLimitedResp:
+    def __init__(self, inner: RespConnection, rps: float) -> None:
+        self._inner = inner
+        self._bucket = TokenBucket(rps)
+
+    async def execute(self, *args: str | bytes) -> Reply:
+        await self._bucket.acquire()
+        return await self._inner.execute(*args)
+
+    async def close(self) -> None:
+        await self._inner.close()
 
 
 async def run_vectors(

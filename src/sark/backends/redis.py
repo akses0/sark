@@ -8,7 +8,7 @@ from sark.engine.scheduler import Executor, ScanContext
 from sark.models import Channel, Event, Verdict
 from sark.registry import VectorSpec, load_vectors
 
-DEFERRED_MILESTONES = {"RED-VALUE-READ": "M3", "RED-CRLF-APP": "M5"}
+DEFERRED_MILESTONES = {"RED-CRLF-APP": "M5"}
 
 
 class RedisBackend(Backend):
