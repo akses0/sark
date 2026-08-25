@@ -1,6 +1,7 @@
-.PHONY: install check format test harness e2e clean
+.PHONY: install check format test harness-up harness-down full-e2e clean
 
 PYTHON ?= python3
+COMPOSE := $(shell command -v podman >/dev/null 2>&1 && echo "podman compose" || echo "docker compose")
 
 install:
 	@command -v uv >/dev/null 2>&1 && uv venv --allow-existing .venv || $(PYTHON) -m venv .venv
@@ -18,13 +19,18 @@ format:
 	.venv/bin/ruff check --fix src tests
 
 test:
-	.venv/bin/pytest -q
+	.venv/bin/pytest tests --ignore=tests/e2e -q
 
-harness:
-	@echo "redis harness variants land in M1 (tests/harness)"
+harness-up:
+	cd tests/harness && $(COMPOSE) up -d
+
+harness-down:
+	cd tests/harness && $(COMPOSE) down -v --remove-orphans
 
 e2e:
-	@echo "golden-file e2e suite lands in M1"
+	SARK_E2E=1 .venv/bin/pytest tests/e2e -q
+
+full-e2e: harness-up e2e harness-down
 
 clean:
 	rm -rf .venv .pytest_cache .mypy_cache .ruff_cache dist *.egg-info src/*.egg-info
