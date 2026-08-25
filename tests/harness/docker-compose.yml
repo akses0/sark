@@ -1,0 +1,31 @@
+services:
+  exposed:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--protected-mode", "no", "--save", "", "--appendonly", "no"]
+    ports:
+      - "16379:6379"
+
+  weak-defaults:
+    image: redis:7.4-alpine
+    command:
+      [
+        "redis-server",
+        "--protected-mode",
+        "no",
+        "--requirepass",
+        "redis",
+        "--save",
+        "",
+        "--appendonly",
+        "no",
+      ]
+    ports:
+      - "16380:6379"
+
+  hardened:
+    image: redis:7.4-alpine
+    volumes:
+      - ./hardened.conf:/etc/redis/hardened.conf:ro,Z
+    command: ["redis-server", "/etc/redis/hardened.conf"]
+    ports:
+      - "16382:6379"

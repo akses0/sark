@@ -8,9 +8,12 @@ from typing import Annotated
 import typer
 
 from sark.backends.redis import RedisBackend
+from sark.backends.redis_vectors import resolve_auth
 from sark.engine.plugins import load_plugins
+from sark.engine.scheduler import ScanContext
 from sark.models import Channel, Event, Verdict
 from sark.report.md import summarize
+from sark.resp import RespConnection, Unreachable
 from sark.targets import Target
 
 app = typer.Typer(
@@ -31,7 +34,7 @@ TargetOption = Annotated[
 ]
 TargetsFileOption = Annotated[
     Path | None,
-    typer.Option("--targets-file", help="TOML or newline-delimited target list."),
+    typer.Option("--targets-file", help="Newline-delimited target list."),
 ]
 RiskOption = Annotated[
     int,
@@ -52,7 +55,7 @@ def _emit(event: Event) -> None:
     print(event.model_dump_json())
 
 
-def _stub_event(run_id: str, target_uri: str, vector: str, detail: str) -> Event:
+def _advisory(run_id: str, target_uri: str, vector: str, detail: str) -> Event:
     return Event(
         run_id=run_id,
         target=target_uri,
@@ -81,6 +84,89 @@ def _resolve_targets(targets: list[str], targets_file: Path | None) -> list[Targ
     return parsed
 
 
+async def _connect_probing_tls(
+    target: Target,
+    *,
+    timeout: float,
+    insecure: bool,
+    ca_file: str | None,
+) -> tuple[RespConnection, bool]:
+    if target.tls:
+        conn = await RespConnection.connect(
+            target.host,
+            target.port,
+            tls=True,
+            insecure=insecure,
+            ca_file=ca_file,
+            timeout=timeout,
+        )
+        return conn, False
+    conn = await RespConnection.connect(
+        target.host,
+        target.port,
+        timeout=timeout,
+    )
+    try:
+        await conn.execute("PING")
+    except (Unreachable, ConnectionError):
+        await conn.close()
+        tls_conn = await RespConnection.connect(
+            target.host,
+            target.port,
+            tls=True,
+            insecure=insecure,
+            ca_file=ca_file,
+            timeout=timeout,
+        )
+        return tls_conn, True
+    except Exception:
+        return conn, False
+    return conn, False
+
+
+async def _scan_target(
+    run_id: str,
+    target: Target,
+    risk: int,
+    timeout: float,
+    insecure: bool,
+    ca_file: str | None,
+    rps: float,
+) -> list[Event]:
+    events: list[Event] = []
+    try:
+        conn, fallback = await _connect_probing_tls(
+            target,
+            timeout=timeout,
+            insecure=insecure,
+            ca_file=ca_file,
+        )
+    except Unreachable as exc:
+        events.append(
+            _advisory(run_id, target.uri(), "RUN-UNREACHABLE", f"connection failed: {exc}")
+        )
+        return events
+    auth_ok, auth_detail = await resolve_auth(conn)
+    ctx = ScanContext(
+        run_id=run_id,
+        target_uri=target.uri(),
+        risk=risk,
+        timeout=timeout,
+        insecure=insecure,
+        ca_file=ca_file,
+        tls_fallback_used=fallback,
+        auth_ping_ok=auth_ok,
+        auth_detail=auth_detail,
+        extra={"requested_tls": "true" if target.tls else "false"},
+    )
+    backend = RedisBackend()
+    jobs = backend.build_jobs(ctx, conn)
+    for _, executor in jobs:
+        events.append(await executor())
+    await conn.close()
+    return events
+
+
 @app.command()
 def scan(
     targets: TargetOption = None,
@@ -90,35 +176,47 @@ def scan(
         Path | None,
         typer.Option("--wordlist", help="Opt-in credential spray; stops on first hit."),
     ] = None,
+    timeout: Annotated[float, typer.Option("--timeout", min=0.5)] = 5.0,
+    rps: Annotated[float, typer.Option("--rps", min=0.1)] = 10.0,
+    insecure: Annotated[
+        bool, typer.Option("--insecure", help="Skip TLS certificate verification.")
+    ] = False,
+    ca_file: Annotated[
+        str | None, typer.Option("--tls-ca", help="CA bundle for TLS verification.")
+    ] = None,
 ) -> None:
     """Fingerprint a Redis instance and run exposure vectors up to the chosen risk."""
-    run_id = _run_id()
     resolved = _resolve_targets(list(targets or []), targets_file)
     backends, plugin_errors = load_plugins()
+    if "redis" not in backends:
+        raise typer.Exit(code=70)
+    all_events: list[Event] = []
+    run_id = _run_id()
     for error in plugin_errors:
-        _emit(
-            Event(
-                run_id=run_id,
-                target="-",
-                vector="RUN-PLUGIN-ERROR",
-                channel=Channel.DIRECT,
-                verdict=Verdict.ADVISORY,
-                detail=error,
+        print(_advisory(run_id, "-", "RUN-PLUGIN-ERROR", error).model_dump_json())
+
+    import asyncio
+
+    async def drive() -> None:
+        for target in resolved:
+            all_events.extend(
+                await _scan_target(
+                    run_id,
+                    target,
+                    risk=risk,
+                    timeout=timeout,
+                    insecure=insecure,
+                    ca_file=ca_file,
+                    rps=rps,
+                )
             )
-        )
-    backend = backends.get("redis") or RedisBackend()
-    registry = backend.vectors()
-    eligible = [spec for spec in registry if spec.tier.value <= risk]
-    for target in resolved:
-        _emit(
-            _stub_event(
-                run_id,
-                target.uri(),
-                "RUN-STUB",
-                f"skeleton build: {len(registry)} vectors registered, "
-                f"{len(eligible)} eligible at risk={risk}; execution lands M1-M2",
-            )
-        )
+
+    asyncio.run(drive())
+    for event in all_events:
+        _emit(event)
+    verdicts = {event.verdict for event in all_events}
+    if Verdict.CONFIRMED in verdicts:
+        raise typer.Exit(code=2)
 
 
 @app.command(name="enum")
@@ -138,7 +236,7 @@ def enum_(
     for target in resolved:
         scope = f" pattern={pattern}" if pattern else ""
         _emit(
-            _stub_event(
+            _advisory(
                 run_id,
                 target.uri(),
                 "ENUM-STUB",
@@ -164,7 +262,7 @@ def dump(
     for target in resolved:
         scope = f" pattern={pattern}" if pattern else ""
         _emit(
-            _stub_event(
+            _advisory(
                 run_id,
                 target.uri(),
                 "DUMP-STUB",
@@ -175,22 +273,20 @@ def dump(
 
 @app.command()
 def report(
-    events: Annotated[Path, typer.Option("--events", help="NDJSON event stream from a run.")],
+    events_path: Annotated[Path, typer.Option("--events", help="NDJSON event stream from a run.")],
     format: Annotated[str, typer.Option("--format", help="Output format.")] = "md",
 ) -> None:
     """Render an event stream into a human-readable report."""
     if format != "md":
         raise typer.BadParameter(f"unsupported format {format!r}: only 'md' ships pre-M4")
     parsed: list[Event] = []
-    rejected = 0
-    for number, line in enumerate(events.read_text(encoding="utf-8").splitlines(), start=1):
+    for number, line in enumerate(events_path.read_text(encoding="utf-8").splitlines(), start=1):
         line = line.strip()
         if not line:
             continue
         try:
             parsed.append(Event.model_validate_json(line))
         except ValueError as exc:
-            rejected += 1
             print(f"skipping malformed event on line {number}: {exc}", file=sys.stderr)
     print(summarize(parsed))
     verdicts = {event.verdict for event in parsed}

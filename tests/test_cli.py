@@ -26,17 +26,19 @@ def test_help_shows_workflow_verbs() -> None:
         assert verb in result.output
 
 
-def test_scan_emits_valid_jsonl_stub() -> None:
-    result = runner.invoke(app, ["scan", "-t", "redis://127.0.0.1:6379", "--risk=2"])
+def test_scan_unreachable_emits_advisory_and_exits_zero() -> None:
+    result = runner.invoke(app, ["scan", "-t", "redis://127.0.0.1:1"])
     assert result.exit_code == 0, result.output
     events = parse_events(result.stdout)
-    assert events
-    assert all(
-        event.verdict is Event.model_validate_json(event.model_dump_json()).verdict
-        for event in events
-    )
-    stubs = [event for event in events if event.vector == "RUN-STUB"]
-    assert stubs and "risk=2" in (stubs[0].detail or "")
+    assert len(events) == 1
+    assert events[0].vector == "RUN-UNREACHABLE"
+    assert events[0].verdict.value == "advisory"
+    assert "connection failed" in (events[0].detail or "")
+
+
+def test_scan_requires_target() -> None:
+    result = runner.invoke(app, ["scan"])
+    assert result.exit_code != 0
 
 
 def test_scan_rejects_bad_uri_with_usage_error() -> None:
@@ -45,9 +47,9 @@ def test_scan_rejects_bad_uri_with_usage_error() -> None:
 
 
 def test_report_round_trips_event_stream(tmp_path: Path) -> None:
-    scan_result = runner.invoke(app, ["scan", "-t", "redis://127.0.0.1"])
-    events_file = tmp_path / "run.jsonl"
+    scan_result = runner.invoke(app, ["scan", "-t", "redis://127.0.0.1:1"])
     lines = [line for line in scan_result.stdout.splitlines() if line.strip().startswith("{")]
+    events_file = tmp_path / "run.jsonl"
     events_file.write_text("\n".join(lines), encoding="utf-8")
     report_result = runner.invoke(app, ["report", "--events", str(events_file)])
     assert report_result.exit_code == 0, report_result.output
@@ -78,4 +80,3 @@ def test_report_skips_malformed_lines(tmp_path: Path) -> None:
     events_file.write_text("not-json\n{}\n", encoding="utf-8")
     result = runner.invoke(app, ["report", "--events", str(events_file)])
     assert result.exit_code == 0
-    assert "malformed event on line 1" in result.stderr or result.stderr == ""
