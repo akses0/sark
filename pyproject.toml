@@ -32,7 +32,7 @@ dev = [
     "mypy>=1.11",
     "pytest>=8",
     "types-PyYAML",
-    "ruff>=0.6",
+    "ruff>=0.16.4",
 ]
 
 [project.scripts]
