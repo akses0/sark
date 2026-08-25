@@ -1,0 +1,64 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "sark"
+version = "0.1.0a0"
+description = "Redis exposure auditing CLI: misconfiguration detection and safe enumeration. Detects default/common passwords; deliberately not a brute-forcer."
+readme = "README.md"
+requires-python = ">=3.12"
+license = "AGPL-3.0-or-later"
+authors = [{ name = "akses" }]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Information Technology",
+    "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Security",
+]
+dependencies = [
+    "pydantic>=2.7,<3",
+    "PyYAML>=6,<7",
+    "rich>=13,<14",
+    "redis>=5,<6",
+    "typer>=0.16",
+]
+
+[project.optional-dependencies]
+dev = [
+    "mypy>=1.11",
+    "pytest>=8",
+    "types-PyYAML",
+    "ruff>=0.6",
+]
+
+[project.scripts]
+sark = "sark.cli:main"
+
+[project.entry-points."sark.backends"]
+redis = "sark.backends.redis:RedisBackend"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sark"]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "UP", "SIM", "RUF"]
+
+[tool.mypy]
+strict = true
+plugins = ["pydantic.mypy"]
+files = ["src"]
+
+[[tool.mypy.overrides]]
+module = "tests.*"
+disallow_untyped_defs = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,45 @@
+vectors:
+  - id: RED-UNAUTH
+    name: Unauthenticated access census (HELLO, COMMAND COUNT, DBSIZE sampling)
+    tier: 1
+    channels: [direct]
+
+  - id: RED-AUTH-CREDS
+    name: Auth-state resolution via curated default/weak matrix and opt-in wordlist spray
+    tier: 2
+    channels: [direct]
+
+  - id: RED-TLS-RESP3
+    name: TLS-required and RESP3 capability detection
+    tier: 1
+    channels: [direct]
+
+  - id: RED-CENSUS
+    name: Multi-DB key-space census via INFO keyspace, SELECT n and incremental SCAN
+    tier: 2
+    channels: [direct]
+
+  - id: RED-VALUE-READ
+    name: Type-aware value sampling of sampled keys (GET/HGETALL/LRANGE/SMEMBERS/ZRANGE)
+    tier: 2
+    channels: [direct]
+
+  - id: RED-LUA-PROBE
+    name: EVAL availability and sandbox presence check against Redis 7+ hardening defaults
+    tier: 2
+    channels: [direct]
+
+  - id: RED-ACL-ENUM
+    name: Principal capability surface mapping (ACL WHOAMI/USERS/GETUSER/CAT, renamed commands)
+    tier: 1
+    channels: [direct]
+
+  - id: RED-CVE-FP
+    name: Version fingerprint mapped to Lua engine CVE advisory table
+    tier: 1
+    channels: [direct]
+
+  - id: RED-CRLF-APP
+    name: CRLF canary write into app-visible values for downstream poisoning detection
+    tier: 3
+    channels: [direct]
