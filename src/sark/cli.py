@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import secrets
 import sys
 from pathlib import Path
@@ -8,13 +9,20 @@ from typing import Annotated
 import typer
 
 from sark.backends.redis import RedisBackend
-from sark.backends.redis_vectors import resolve_auth
+from sark.backends.redis_vectors import (
+    CURATED_MATRIX,
+    masked_auth_evidence,
+    resolve_auth,
+    try_credentials,
+)
 from sark.engine.plugins import load_plugins
 from sark.engine.scheduler import ScanContext
 from sark.models import Channel, Event, Verdict
 from sark.report.md import summarize
 from sark.resp import RespConnection, Unreachable
 from sark.targets import Target
+
+MAX_WORDLIST_ENTRIES = 10_000
 
 app = typer.Typer(
     name="sark",
@@ -124,6 +132,61 @@ async def _connect_probing_tls(
     return conn, False
 
 
+def _load_wordlist(path: Path | None) -> list[str]:
+    if path is None:
+        return []
+    entries = []
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        entry = line.strip()
+        if entry:
+            entries.append(entry)
+        if len(entries) >= MAX_WORDLIST_ENTRIES:
+            break
+    return entries
+
+
+async def _credential_phase(
+    conn: RespConnection,
+    ctx: ScanContext,
+    candidates: list[tuple[str | None, str]],
+) -> tuple[Event, ScanContext]:
+    outcome = await try_credentials(conn, candidates)
+    if outcome is not None:
+        principal = outcome.username or "default"
+        detail = f"default/common credential accepted for user={principal} (weak authentication)"
+        state = "valid-but-restricted" if outcome.restricted else "authenticated"
+        ping_ok = not outcome.restricted
+        event = Event(
+            run_id=ctx.run_id,
+            target=ctx.target_uri,
+            vector="RED-AUTH-CREDS",
+            channel=Channel.DIRECT,
+            verdict=Verdict.CONFIRMED,
+            confidence=1.0,
+            detail=f"{detail}; auth-state={state}",
+            evidence=masked_auth_evidence(),
+        )
+        updated = ctx.derived(
+            auth_username=outcome.username,
+            auth_password=outcome.password,
+            auth_restricted=outcome.restricted,
+            auth_ping_ok=ping_ok or ctx.auth_ping_ok,
+            auth_detail=f"authenticated as {principal} ({state})",
+        )
+        return event, updated
+    event = Event(
+        run_id=ctx.run_id,
+        target=ctx.target_uri,
+        vector="RED-AUTH-CREDS",
+        channel=Channel.DIRECT,
+        verdict=Verdict.REFUTED,
+        confidence=0.85,
+        detail=f"no credential accepted from {len(candidates)} curated/default candidates",
+        evidence=masked_auth_evidence(),
+    )
+    return event, ctx
+
+
 async def _scan_target(
     run_id: str,
     target: Target,
@@ -132,6 +195,9 @@ async def _scan_target(
     insecure: bool,
     ca_file: str | None,
     rps: float,
+    user: str | None,
+    password: str | None,
+    wordlist_entries: list[str],
 ) -> list[Event]:
     events: list[Event] = []
     try:
@@ -159,6 +225,37 @@ async def _scan_target(
         auth_detail=auth_detail,
         extra={"requested_tls": "true" if target.tls else "false"},
     )
+    if risk >= 2:
+        if auth_ok:
+            events.append(
+                Event(
+                    run_id=run_id,
+                    target=target.uri(),
+                    vector="RED-AUTH-CREDS",
+                    channel=Channel.DIRECT,
+                    verdict=Verdict.REFUTED,
+                    confidence=1.0,
+                    detail="authentication not required; anonymous principal active",
+                )
+            )
+        else:
+            candidates: list[tuple[str | None, str]] = []
+            if password and user:
+                candidates.append((user, password))
+            elif password:
+                candidates.append((None, password))
+            candidates.extend((None, entry) for entry in CURATED_MATRIX)
+            candidates.extend((user, entry) for entry in wordlist_entries)
+            cred_event, ctx = await _credential_phase(conn, ctx, candidates)
+            events.append(cred_event)
+            if cred_event.verdict is Verdict.REFUTED and ctx.auth_ping_ok is False:
+                handoff = (
+                    "curated matrix exhausted; sark detects misconfigurations, it does not "
+                    "brute-force. For proper rotation use hydra, legba, "
+                    "nmap --script redis-brute or msf auxiliary/scanner/redis/redis_login, "
+                    "then rerun with --user/--pass."
+                )
+                events.append(_advisory(run_id, target.uri(), "RUN-HANDOFF", handoff))
     backend = RedisBackend()
     jobs = backend.build_jobs(ctx, conn)
     for _, executor in jobs:
@@ -172,6 +269,12 @@ def scan(
     targets: TargetOption = None,
     targets_file: TargetsFileOption = None,
     risk: RiskOption = 1,
+    user: Annotated[
+        str | None, typer.Option("--user", help="ACL username for authentication attempts.")
+    ] = None,
+    password: Annotated[
+        str | None, typer.Option("--pass", help="Password for resumed runs with known creds.")
+    ] = None,
     wordlist: Annotated[
         Path | None,
         typer.Option("--wordlist", help="Opt-in credential spray; stops on first hit."),
@@ -190,12 +293,11 @@ def scan(
     backends, plugin_errors = load_plugins()
     if "redis" not in backends:
         raise typer.Exit(code=70)
+    wordlist_entries = _load_wordlist(wordlist)
     all_events: list[Event] = []
     run_id = _run_id()
     for error in plugin_errors:
         print(_advisory(run_id, "-", "RUN-PLUGIN-ERROR", error).model_dump_json())
-
-    import asyncio
 
     async def drive() -> None:
         for target in resolved:
@@ -208,6 +310,9 @@ def scan(
                     insecure=insecure,
                     ca_file=ca_file,
                     rps=rps,
+                    user=user,
+                    password=password,
+                    wordlist_entries=wordlist_entries,
                 )
             )
 

@@ -4,7 +4,9 @@ import asyncio
 import contextlib
 import hashlib
 import ssl
+from collections.abc import Awaitable
 from dataclasses import dataclass
+from typing import Protocol
 
 CRLF = b"\r\n"
 
@@ -53,6 +55,17 @@ def encode_command(*args: Token) -> bytes:
         blob = arg.encode() if isinstance(arg, str) else arg
         parts.append(b"$" + str(len(blob)).encode() + CRLF + blob + CRLF)
     return b"".join(parts)
+
+
+class SupportsResp(Protocol):
+    def execute(self, *args: str | bytes) -> Awaitable[Reply]: ...
+
+
+@dataclass(frozen=True)
+class AuthOutcome:
+    username: str | None
+    password: str
+    restricted: bool
 
 
 class RespConnection:
@@ -172,10 +185,12 @@ def wire_preview(raw: bytes, limit: int = 240) -> str:
 
 __all__ = [
     "CRLF",
+    "AuthOutcome",
     "ProtocolError",
     "Reply",
     "RespConnection",
     "RespError",
+    "SupportsResp",
     "Unreachable",
     "encode_command",
     "wire_preview",

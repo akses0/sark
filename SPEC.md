@@ -77,6 +77,7 @@ Every technique is a registered vector with stable ID, safety tier, required cha
 | RED-VALUE-READ | Type-aware GET/HGETALL/LRANGE/etc. sampling of sampled keys | RISKY | direct |
 | RED-LUA-PROBE | EVAL availability + sandbox presence check (pure arithmetic canary), reported against Redis ≥7 hardening defaults | RISKY | direct |
 | RED-ACL-ENUM | Principal capability surface: ACL WHOAMI / USERS / GETUSER (incl. Redis 7 selectors), ACL CAT @dangerous, renamed-command inference via COMMAND INFO, MODULE LIST / FUNCTION LIST (+ WITHCODE leak check) | SAFE | direct |
+| RED-CONFIG-AUDIT | Post-auth configuration audit: protected-mode/bind exposure, RCE-primitive flags (`enable-module-command`, `enable-protected-configs`) reported as available/local-only/disabled | RISKY | direct |
 | RED-CVE-FP | Version fingerprint mapped to advisory table — Lua engine family (CVE-2022-0543 Debian packaging; CVE-2025-49844/-46817/-46818; CVE-2026-23631 DarkReplica); advisories linked, never exploited | SAFE | direct |
 | RED-CRLF-APP | CRLF injection into app-visible values to poison downstream consumers (detection payload w/ canary marker, single key write) | DESTRUCTIVE* | direct |
 
@@ -302,6 +303,7 @@ Resolved:
 11. **[RESOLVED]** CLI help quality bar: terse one-line verb descriptions; plain language, no jargon walls; every verb ships at least two examples drawn from the most common use cases (`scan` unauth check, `scan --risk=2` audit, `dump --pattern ... --stop 1000`, `report` render); flags documented by analogy where conventions are shared (sqlmap-style).
 12. **[RESOLVED]** CI: GitHub Actions as a *dumb runner* — checkout + Python setup + `make` invocation, nothing else (no reusable workflows, no marketplace sprawl). Free for public repos, native Docker services for the e2e harness, OIDC trusted publishing when PyPI release day comes. Provider lock-in avoided because all gates live behind Makefile targets; migrating providers later is a ~20-line rewrite.
 13. **[RESOLVED]** RESP transport is hand-rolled in-repo (`src/sark/resp.py`) instead of redis-py. Rationale: evidence-grade wire transcripts (§11) require capturing exact request/reply bytes, which driver clients erase by design; the protocol is small enough that a typed async client (~200 lines) carries less risk than the dependency. redis-py remains listed as a future option only if dump-scale features demand it.
+14. **[RESOLVED]** Registry amendment (M2): added `RED-CONFIG-AUDIT` (RISKY, direct) — the M2 milestone's "config audit" had no vector ID; added rather than overloading RED-AUTH-CREDS. Config-audit is read-only in action but tiered RISKY because it is post-auth heavy-read recon. AUTH-CREDS wire evidence is always masked (`***`) — a security tool must never write discovered credentials into its own evidence store. Restricted-principal detection discriminates via a benign `CONFIG GET protected-mode` NOPERM probe after successful AUTH + PING (PING alone is insufficient: restricted users commonly hold `+ping`).
 
 Open:
 

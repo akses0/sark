@@ -12,6 +12,7 @@ EXPECTED_IDS = {
     "RED-LUA-PROBE",
     "RED-ACL-ENUM",
     "RED-CVE-FP",
+    "RED-CONFIG-AUDIT",
     "RED-CRLF-APP",
 }
 

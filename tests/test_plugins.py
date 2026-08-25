@@ -14,7 +14,7 @@ def test_builtin_redis_backend_discoverable() -> None:
 
 def test_redis_backend_serves_registry() -> None:
     backend = RedisBackend()
-    assert len(backend.vectors()) == 9
+    assert len(backend.vectors()) == 10
 
 
 def test_broken_plugin_is_reported_not_fatal(monkeypatch: object) -> None:

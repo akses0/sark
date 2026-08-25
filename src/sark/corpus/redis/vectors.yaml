@@ -19,6 +19,11 @@ vectors:
     tier: 2
     channels: [direct]
 
+  - id: RED-CONFIG-AUDIT
+    name: Configuration audit (protected-mode, bind, RCE-primitive flags) against hardening defaults
+    tier: 2
+    channels: [direct]
+
   - id: RED-VALUE-READ
     name: Type-aware value sampling of sampled keys (GET/HGETALL/LRANGE/SMEMBERS/ZRANGE)
     tier: 2

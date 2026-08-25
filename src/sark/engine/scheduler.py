@@ -34,6 +34,9 @@ class ScanContext(BaseModel):
     tls_fallback_used: bool = False
     auth_ping_ok: bool | None = None
     auth_detail: str | None = None
+    auth_username: str | None = None
+    auth_password: str | None = None
+    auth_restricted: bool = False
     extra: dict[str, str] = Field(default_factory=dict)
 
     def derived(self, **changes: object) -> ScanContext:

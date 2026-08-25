@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from collections.abc import Awaitable, Callable
 
 from sark.backends.redis_cves import evaluate
@@ -12,13 +13,69 @@ from sark.models import (
     ResponseEvidence,
     Verdict,
 )
-from sark.resp import Reply, RespConnection, RespError, wire_preview
+from sark.resp import AuthOutcome, Reply, RespError, SupportsResp, wire_preview
 
 ScanFn = Callable[..., Awaitable[Event]]
 
 DANGEROUS_COMMANDS = ("CONFIG", "EVAL", "MODULE", "REPLICAOF", "FLUSHALL", "DEBUG")
 
-IMPLEMENTED_SAFE = frozenset({"RED-UNAUTH", "RED-TLS-RESP3", "RED-ACL-ENUM", "RED-CVE-FP"})
+IMPLEMENTED = frozenset(
+    {
+        "RED-UNAUTH",
+        "RED-TLS-RESP3",
+        "RED-ACL-ENUM",
+        "RED-CVE-FP",
+        "RED-CONFIG-AUDIT",
+        "RED-AUTH-CREDS",
+        "RED-LUA-PROBE",
+        "RED-CENSUS",
+    }
+)
+
+PHASE_HANDLED = frozenset({"RED-AUTH-CREDS"})
+
+CURATED_MATRIX: tuple[str, ...] = (
+    "redis",
+    "foobared",
+    "root",
+    "admin",
+    "administrator",
+    "password",
+    "password1",
+    "p@ssw0rd",
+    "changeme",
+    "changeit",
+    "default",
+    "test",
+    "guest",
+    "welcome",
+    "admin123",
+    "root123",
+    "redis123",
+    "redispass",
+    "cache",
+    "dev",
+    "development",
+    "staging",
+    "prod",
+    "production",
+    "secret",
+    "secret123",
+    "mypass",
+    "mypassword",
+    "123456",
+    "123456789",
+    "qwerty",
+    "letmein",
+    "docker",
+    "kubernetes",
+    "sentinel",
+    "cluster",
+    "masterauth",
+    "database",
+    "dbpass",
+    "node",
+)
 
 
 def mk_event(
@@ -49,7 +106,18 @@ def mk_event(
     )
 
 
-async def resolve_auth(conn: RespConnection) -> tuple[bool | None, str]:
+def masked_auth_evidence(reply: Reply | None = None) -> Evidence:
+    masked_wire = "*2\r\n$4\r\nAUTH\r\n$3\r\n***"
+    commands = [CommandEvidence(wire=masked_wire)]
+    responses = []
+    if reply is not None:
+        responses.append(
+            ResponseEvidence(prefix=reply.prefix, size=reply.size, sha256=reply.sha256)
+        )
+    return Evidence(commands=commands, responses=responses)
+
+
+async def resolve_auth(conn: SupportsResp) -> tuple[bool | None, str]:
     try:
         reply = await conn.execute("PING")
     except RespError as exc:
@@ -60,6 +128,39 @@ async def resolve_auth(conn: RespConnection) -> tuple[bool | None, str]:
     return True, reply.text()
 
 
+async def try_credentials(
+    conn: SupportsResp,
+    candidates: list[tuple[str | None, str]],
+) -> AuthOutcome | None:
+    for username, password in candidates:
+        try:
+            if username:
+                await conn.execute("AUTH", username, password)
+            else:
+                await conn.execute("AUTH", password)
+        except RespError as exc:
+            upper = exc.message.upper()
+            if "WRONGPASS" in upper or "invalid password" in upper.lower():
+                continue
+            if "NOAUTH" in upper or "AUTHENTICATION" in upper:
+                continue
+            raise
+        restricted = False
+        try:
+            await conn.execute("PING")
+        except RespError as exc:
+            if "NOPERM" in exc.message.upper():
+                restricted = True
+        else:
+            try:
+                await conn.execute("CONFIG", "GET", "protected-mode")
+            except RespError as exc:
+                if "NOPERM" in exc.message.upper():
+                    restricted = True
+        return AuthOutcome(username=username, password=password, restricted=restricted)
+    return None
+
+
 def info_field(info_text: str, key: str) -> str | None:
     for line in info_text.splitlines():
         if line.startswith(f"{key}:"):
@@ -67,7 +168,26 @@ def info_field(info_text: str, key: str) -> str | None:
     return None
 
 
-async def red_unauth(ctx: ScanContext, conn: RespConnection) -> Event:
+def parse_keyspace(info_text: str) -> dict[str, int]:
+    databases: dict[str, int] = {}
+    pattern = re.compile(r"^db(\d+):keys=(\d+)")
+    for line in info_text.splitlines():
+        match = pattern.match(line)
+        if match:
+            databases[f"db{match.group(1)}"] = int(match.group(2))
+    return databases
+
+
+async def red_unauth(ctx: ScanContext, conn: SupportsResp) -> Event:
+    if ctx.auth_username is not None or ctx.auth_password is not None:
+        return mk_event(
+            ctx,
+            "RED-UNAUTH",
+            Verdict.REFUTED,
+            1.0,
+            "authentication required; anonymous access refused "
+            "(auth-state resolved via credential phase)",
+        )
     try:
         reply = await conn.execute("PING")
     except RespError as exc:
@@ -97,7 +217,7 @@ async def red_unauth(ctx: ScanContext, conn: RespConnection) -> Event:
     )
 
 
-async def red_tls_resp3(ctx: ScanContext, conn: RespConnection) -> Event:
+async def red_tls_resp3(ctx: ScanContext, conn: SupportsResp) -> Event:
     try:
         hello = await conn.execute("HELLO", "3")
     except RespError as exc:
@@ -129,8 +249,8 @@ async def red_tls_resp3(ctx: ScanContext, conn: RespConnection) -> Event:
     )
 
 
-async def red_acl_enum(ctx: ScanContext, conn: RespConnection) -> Event:
-    if ctx.auth_ping_ok is False:
+async def red_acl_enum(ctx: ScanContext, conn: SupportsResp) -> Event:
+    if ctx.auth_ping_ok is False and not ctx.auth_restricted:
         return mk_event(
             ctx,
             "RED-ACL-ENUM",
@@ -140,6 +260,7 @@ async def red_acl_enum(ctx: ScanContext, conn: RespConnection) -> Event:
         )
     available: list[str] = []
     renamed_or_missing: list[str] = []
+    denied: list[str] = []
     replies: list[Reply] = []
     whoami = None
     try:
@@ -152,6 +273,9 @@ async def red_acl_enum(ctx: ScanContext, conn: RespConnection) -> Event:
         try:
             info = await conn.execute("COMMAND", "INFO", command)
         except RespError as exc:
+            if "NOPERM" in exc.message.upper():
+                denied.append(command)
+                continue
             return mk_event(
                 ctx,
                 "RED-ACL-ENUM",
@@ -169,6 +293,8 @@ async def red_acl_enum(ctx: ScanContext, conn: RespConnection) -> Event:
         parts.append(f"dangerous-available={','.join(available)}")
     if renamed_or_missing:
         parts.append(f"renamed-or-missing={','.join(renamed_or_missing)}")
+    if denied:
+        parts.append(f"acl-denied={','.join(denied)}")
     if available:
         return mk_event(
             ctx,
@@ -188,7 +314,7 @@ async def red_acl_enum(ctx: ScanContext, conn: RespConnection) -> Event:
     )
 
 
-async def red_cve_fp(ctx: ScanContext, conn: RespConnection) -> Event:
+async def red_cve_fp(ctx: ScanContext, conn: SupportsResp) -> Event:
     try:
         info = await conn.execute("INFO", "server")
     except RespError as exc:
@@ -253,9 +379,185 @@ async def red_cve_fp(ctx: ScanContext, conn: RespConnection) -> Event:
     )
 
 
+async def red_config_audit(ctx: ScanContext, conn: SupportsResp) -> Event:
+    try:
+        cfg_reply = await conn.execute("CONFIG", "GET", "*")
+    except RespError as exc:
+        upper = exc.message.upper()
+        if "NOPERM" in upper:
+            return mk_event(
+                ctx,
+                "RED-CONFIG-AUDIT",
+                Verdict.INCONCLUSIVE,
+                0.4,
+                f"config surface hidden from principal (NOPERM): -{exc.message}",
+            )
+        if "UNKNOWN COMMAND" in upper:
+            return mk_event(
+                ctx,
+                "RED-CONFIG-AUDIT",
+                Verdict.REFUTED,
+                0.9,
+                "CONFIG renamed or unavailable; audit surface closed",
+            )
+        return mk_event(
+            ctx,
+            "RED-CONFIG-AUDIT",
+            Verdict.INCONCLUSIVE,
+            0.3,
+            f"CONFIG GET failed: -{exc.message}",
+        )
+    raw_value = cfg_reply.value
+    pairs: list[tuple[str, str]] = []
+    if isinstance(raw_value, dict):
+        pairs = [(str(key), str(value)) for key, value in raw_value.items()]
+    elif isinstance(raw_value, list):
+        pairs = [
+            (str(raw_value[index]), str(raw_value[index + 1]))
+            for index in range(0, len(raw_value) - 1, 2)
+        ]
+    config = dict(pairs)
+    protected_mode = config.get("protected-mode", "")
+    bind = config.get("bind", "")
+    enable_module = config.get("enable-module-command", "")
+    enable_protected_configs = config.get("enable-protected-configs", "")
+    binds_all = bind == "" or bind.startswith("*") or "0.0.0.0" in bind or "::" in bind
+    exposure = protected_mode == "no" and binds_all
+    remote_primitives = enable_module == "yes" or enable_protected_configs == "yes"
+    local_only_primitives = enable_module == "local" or enable_protected_configs == "local"
+    bits = [
+        f"protected-mode={protected_mode or 'n/a'}",
+        f"bind={bind or '(all interfaces)'}",
+        f"enable-module-command={enable_module or 'unset'}",
+        f"enable-protected-configs={enable_protected_configs or 'unset'}",
+    ]
+    detail = "; ".join(bits)
+    if remote_primitives:
+        detail += "; RCE-enabling primitives reachable remotely"
+        return mk_event(
+            ctx,
+            "RED-CONFIG-AUDIT",
+            Verdict.CONFIRMED,
+            0.95,
+            detail,
+            replies=[cfg_reply],
+        )
+    if exposure:
+        detail += "; service bound to all interfaces with protected mode disabled"
+        return mk_event(
+            ctx,
+            "RED-CONFIG-AUDIT",
+            Verdict.CONFIRMED,
+            0.9,
+            detail,
+            replies=[cfg_reply],
+        )
+    if local_only_primitives:
+        detail += "; primitives restricted to local/loopback clients"
+        return mk_event(
+            ctx,
+            "RED-CONFIG-AUDIT",
+            Verdict.REFUTED,
+            0.85,
+            detail,
+            replies=[cfg_reply],
+        )
+    return mk_event(
+        ctx,
+        "RED-CONFIG-AUDIT",
+        Verdict.REFUTED,
+        0.9,
+        detail,
+        replies=[cfg_reply],
+    )
+
+
+async def red_lua_probe(ctx: ScanContext, conn: SupportsResp) -> Event:
+    try:
+        reply = await conn.execute("EVAL", "return 1", "0")
+    except RespError as exc:
+        upper = exc.message.upper()
+        if "NOPERM" in upper:
+            return mk_event(
+                ctx,
+                "RED-LUA-PROBE",
+                Verdict.REFUTED,
+                0.9,
+                f"EVAL denied by ACL (-{exc.message})",
+            )
+        if "UNKNOWN COMMAND" in upper or "RENAME" in upper:
+            return mk_event(
+                ctx,
+                "RED-LUA-PROBE",
+                Verdict.REFUTED,
+                0.9,
+                "EVAL renamed or removed; scripting entry closed",
+            )
+        return mk_event(
+            ctx,
+            "RED-LUA-PROBE",
+            Verdict.INCONCLUSIVE,
+            0.3,
+            f"EVAL probe failed: -{exc.message}",
+        )
+    if reply.value == 1:
+        return mk_event(
+            ctx,
+            "RED-LUA-PROBE",
+            Verdict.CONFIRMED,
+            0.7,
+            "EVAL available; Lua sandbox arithmetic canary executed (scripting primitive open)",
+            replies=[reply],
+        )
+    return mk_event(
+        ctx,
+        "RED-LUA-PROBE",
+        Verdict.INCONCLUSIVE,
+        0.3,
+        f"EVAL returned unexpected value: {reply.value!r}",
+        replies=[reply],
+    )
+
+
+async def red_census(ctx: ScanContext, conn: SupportsResp) -> Event:
+    try:
+        info = await conn.execute("INFO", "keyspace")
+    except RespError as exc:
+        return mk_event(
+            ctx,
+            "RED-CENSUS",
+            Verdict.INCONCLUSIVE,
+            0.3,
+            f"keyspace inventory unavailable: -{exc.message}",
+        )
+    databases = parse_keyspace(info.text())
+    total = sum(databases.values())
+    summary = ", ".join(f"{name}={count} keys" for name, count in sorted(databases.items()))
+    if not databases:
+        return mk_event(
+            ctx,
+            "RED-CENSUS",
+            Verdict.REFUTED,
+            0.8,
+            "keyspace empty across logical DBs visible to principal",
+            replies=[info],
+        )
+    return mk_event(
+        ctx,
+        "RED-CENSUS",
+        Verdict.CONFIRMED,
+        0.8,
+        f"data present ({total} keys): {summary}; full namespace mapping lands in M3 enum",
+        replies=[info],
+    )
+
+
 EXECUTORS: dict[str, ScanFn] = {
     "RED-UNAUTH": red_unauth,
     "RED-TLS-RESP3": red_tls_resp3,
     "RED-ACL-ENUM": red_acl_enum,
     "RED-CVE-FP": red_cve_fp,
+    "RED-CONFIG-AUDIT": red_config_audit,
+    "RED-LUA-PROBE": red_lua_probe,
+    "RED-CENSUS": red_census,
 }
