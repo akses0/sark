@@ -158,7 +158,7 @@ Verdict model: every finding carries `confidence ∈ [0,1]`, channel used, repet
 
 ## 7. Payload Grammar & Encoder Pipeline *(deferred with HTTP-mediated plugins)*
 
-The full design (JSON/bracket-php/bracket-rails/dot-notation/urlencoded encoder pipeline, YAML corpus templating, GraphQL adapter plugin, round-trip property tests against qs/Rack/PHP reference parsers) is retained from DRAFT v1 for the MongoDB/CouchDB plugins. Redis v1 speaks RESP directly via redis-py and needs none of it.
+The full design (JSON/bracket-php/bracket-rails/dot-notation/urlencoded encoder pipeline, YAML corpus templating, GraphQL adapter plugin, round-trip property tests against qs/Rack/PHP reference parsers) is retained from DRAFT v1 for the MongoDB/CouchDB plugins. Redis v1 speaks RESP through the in-repo client (`resp.py`, decision #13) and needs none of it.
 
 ## 8. Enumeration & Exploitation (`enum` / `dump`)
 
@@ -244,22 +244,26 @@ Responses over 64KB stored as file refs. HTTP request/response evidence shapes r
 ```
 sark/
 ├── cli.py               # verb dispatch: scan, enum, dump, report (typer)
-├── models.py            # pydantic: Target, Event, Verdict
+├── models.py            # pydantic: Event, Verdict, Channel, SafetyTier, AuthState
+├── targets.py           # redis:// · rediss:// URI parsing
+├── resp.py              # in-repo async RESP client w/ wire-transcript capture
+├── registry.py          # YAML vector corpus loader (pydantic-validated)
 ├── engine/
-│   ├── scheduler.py     # async orchestration, rate limiter, scope guard
+│   ├── scheduler.py     # ScanContext, token-bucket rate limiter, job runner
 │   ├── oracles/         # direct.py error.py (active) · boolean.py timing.py oob.py (interfaces, inactive)
-│   └── plugins.py       # plugin loader/registry (entry-point based)
+│   └── plugins.py       # entry-point loader for sark.backends
 ├── backends/
-│   ├── base.py          # Backend plugin ABC: fingerprint(), vectors(), readers()
-│   └── redis.py         # the only built-in backend
-│       # mongodb.py / couchdb.py ship as plugins post-v1 via this same ABI
-├── corpus/redis/        # YAML vector definitions
+│   ├── base.py          # Backend plugin ABC: vectors()
+│   ├── redis.py         # built-in backend: registry + job assembly
+│   ├── redis_vectors.py # SAFE-tier executors + auth-state resolution
+│   └── redis_cves.py    # Lua CVE family advisory table + branch-aware evaluation
+├── corpus/redis/vectors.yaml
 ├── report/{md.py html.py sarif.py}
 └── safety/guardlist.py scope.py ratelimit.py
 ```
 
 - Plugin ABI (core, from M0): plugins register via Python entry points (`sark.backends`, `sark.points`) and implement `Backend` (fingerprint, vector registry contribution, client factory, extraction strategy). The built-in Redis backend consumes the same ABI — no private core shortcuts. MongoDB ships as the first backend plugin; GraphQL adapter and Elasticsearch/Cassandra follow.
-- Stack: Python ≥3.12, asyncio, redis-py ≥5, pydantic v2, typer, rich. Minimal dependency philosophy — no framework beyond these. httpx/pymongo join only when their backends do.
+- Stack: Python ≥3.12, asyncio, pydantic v2, typer, rich, PyYAML. The RESP protocol client is **in-repo** (`resp.py`), not redis-py: transcript-perfect wire capture is an evidence pillar (§11) and app-oriented driver clients abstract the wire away. httpx/pymongo join only when their backends do. Minimal dependency philosophy — no framework beyond these.
 - **Typing discipline (invariant)**: `mypy --strict` must stay green from M0 onward — it is an acceptance criterion of every milestone, not a cleanup task. Boundary rule: no bare `dict`/`Any` crosses a module or process boundary; targets, events, vector payloads, configs, and corpus entries all flow through pydantic v2 models (runtime-validated at load). Type safety is enforced at CI instead of compile time — same guarantee, one step later.
 - Packaging: pip-installable, `pyproject.toml`, console script `sark`. Users install via `pipx install sark` or `uv tool install sark` from PyPI — both documented as first-class paths in the README. Packed binaries (PyInstaller et al.) are excluded by policy: EDR false-positive reputation makes them counterproductive for offensive tooling, and our audience definitionally has Python.
 
@@ -297,6 +301,7 @@ Resolved:
 10. **[RESOLVED]** Documentation & delivery policy: lean README only — install (`pipx` / `uv tool`) plus a copy-paste quickstart; usage reference lives in a wiki. No packed binaries. All dev gates exposed as Makefile targets (`make check`, `test`, `harness`, `e2e`) — the Makefile is the canonical task surface for humans, agents, and CI alike.
 11. **[RESOLVED]** CLI help quality bar: terse one-line verb descriptions; plain language, no jargon walls; every verb ships at least two examples drawn from the most common use cases (`scan` unauth check, `scan --risk=2` audit, `dump --pattern ... --stop 1000`, `report` render); flags documented by analogy where conventions are shared (sqlmap-style).
 12. **[RESOLVED]** CI: GitHub Actions as a *dumb runner* — checkout + Python setup + `make` invocation, nothing else (no reusable workflows, no marketplace sprawl). Free for public repos, native Docker services for the e2e harness, OIDC trusted publishing when PyPI release day comes. Provider lock-in avoided because all gates live behind Makefile targets; migrating providers later is a ~20-line rewrite.
+13. **[RESOLVED]** RESP transport is hand-rolled in-repo (`src/sark/resp.py`) instead of redis-py. Rationale: evidence-grade wire transcripts (§11) require capturing exact request/reply bytes, which driver clients erase by design; the protocol is small enough that a typed async client (~200 lines) carries less risk than the dependency. redis-py remains listed as a future option only if dump-scale features demand it.
 
 Open:
 
